@@ -17,12 +17,12 @@ tare_planner_node:
     pub_momentum_activation_count_topic_ : momentum_activation_count
 
     kAutoStart : true
-    kRushHome : true
+    kRushHome : false
     kUseTerrainHeight : true
     kCheckTerrainCollision : true
     kExtendWayPoint : true
     kUseLineOfSightLookAheadPoint : true
-    kNoExplorationReturnHome : true
+    kNoExplorationReturnHome : false
     kExtendWayPointDistanceBig : 8.0
     kExtendWayPointDistanceSmall : 4.5
     kKeyposeCloudDwzFilterLeafSize : 0.2
@@ -37,8 +37,8 @@ tare_planner_node:
 
     # PlanningEnv
     kUseFrontier : true
-    kFrontierClusterTolerance : 1.0
-    kFrontierClusterMinSize : 30
+    kFrontierClusterTolerance : 2.0
+    kFrontierClusterMinSize : 20
     kUseCoverageBoundaryOnFrontier : false 
     kUseCoverageBoundaryOnObjectSurface : false
 
@@ -110,9 +110,9 @@ tare_planner_node:
     kMinAddPointNumBig : 60
     kMinAddFrontierPointNum : 15
     kCellExploringToCoveredThr : 1
-    kCellCoveredToExploringThr: 10
-    kCellExploringToAlmostCoveredThr: 10
-    kCellAlmostCoveredToExploringThr: 20
+    kCellCoveredToExploringThr: 5
+    kCellExploringToAlmostCoveredThr: 5
+    kCellAlmostCoveredToExploringThr: 10
     kCellUnknownToExploringThr: 1
 
     # Visualization

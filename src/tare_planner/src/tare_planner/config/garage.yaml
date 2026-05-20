@@ -16,6 +16,43 @@ tare_planner_node:
     pub_waypoint_topic_ : /way_point
     pub_momentum_activation_count_topic_ : momentum_activation_count
 
+    # ============================================================
+    # NARROW SPACE DEADLOCK FIX PARAMETERS (Added for narrow passages)
+    # ============================================================
+    # Maximum exploration time before forcing exploration_finish (seconds)
+    # This is a SAFETY MECHANISM to prevent infinite deadlock
+    kMaxExplorationTimeSeconds : 600.0
+    # Number of consecutive cycles where robot cannot make progress before giving up
+    kStuckCycleThreshold : 50
+    # Distance threshold to consider robot as "making progress" (meters)
+    kProgressDistanceThreshold : 0.5
+    # ============================================================
+
+    # ============================================================
+    # WAYPOINT DEADLOCK FIX PARAMETERS (Critical for stuck waypoints)
+    # ============================================================
+    # Maximum time (seconds) to stay at same waypoint before forcing permanent blacklist
+    # ABSOLUTE TIMEOUT: No matter what robot does, timeout after this duration
+    kWaypointTimeout : 15.0
+    # Maximum retry attempts before forcing aggressive reset
+    # After this many retries, waypoint is set very close to robot to force replanning
+    kWaypointMaxRetries : 1
+    # ============================================================
+
+    # ============================================================
+    # REGION BLACKLIST FIX PARAMETERS (For fence/barrier deadlocks)
+    # ============================================================
+    # Radius (meters) of region to blacklist when waypoint is unreachable
+    # Set to ~2x the robot size to block the area around stuck waypoints
+    kRegionBlacklistRadius : 2.0
+    # Maximum number of blacklisted regions to track
+    # Prevents memory overflow in large environments
+    kRegionBlacklistMaxSize : 10
+    # Maximum retries per region before permanent blacklist
+    # After this, the region is considered permanently unreachable
+    kRegionBlacklistMaxRetries : 5
+    # ============================================================
+
     kAutoStart : true
     kRushHome : false
     kUseTerrainHeight : true
@@ -30,9 +67,12 @@ tare_planner_node:
     kAtHomeDistThreshold : 0.5
     kTerrainCollisionThreshold : 0.5
     kLookAheadDistance : 8.0
-    kUseMomentum : false 
-    kDirectionChangeCounterThr : 6
-    kDirectionNoChangeCounterThr : 5
+    # FIX: Enable momentum to prevent oscillation in narrow spaces
+    kUseMomentum : true
+    # FIX: Increase direction change threshold to make robot more persistent
+    kDirectionChangeCounterThr : 12
+    # FIX: Increase no-change threshold to reduce direction switching
+    kDirectionNoChangeCounterThr : 10
     kResetWaypointJoystickAxesID : 2
 
     # PlanningEnv
@@ -79,14 +119,21 @@ tare_planner_node:
     kConnectivityHeightDiffThr : 0.25
     kGreedyViewPointSampleRange : 3
     kLocalPathOptimizationItrMax : 10
-    kViewPointCollisionMargin : 1.2
-    kViewPointCollisionMarginZPlus : 0.5
-    kViewPointCollisionMarginZMinus : 0.5
+    # ============================================================
+    # NARROW SPACE FIX: Reduce collision margins to allow tighter passages
+    # ============================================================
+    # FIX: Reduce collision margin to allow robot to pass through narrow spaces
+    kViewPointCollisionMargin : 0.5
+    # FIX: Reduce Z-axis collision margins
+    kViewPointCollisionMarginZPlus : 0.3
+    kViewPointCollisionMarginZMinus : 0.3
     kCollisionGridZScale : 1.0
-    kCollisionGridResolutionX : 0.2
-    kCollisionGridResolutionY : 0.2
+    # FIX: Increase collision grid resolution to be less sensitive to small obstacles
+    kCollisionGridResolutionX : 0.3
+    kCollisionGridResolutionY : 0.3
     kCollisionGridResolutionZ : 0.0
-    kCollisionPointThr : 2
+    # FIX: Reduce point threshold so robot doesn't get scared by few scattered points
+    kCollisionPointThr : 1
     kLineOfSightStopAtNearestObstacle : true
     kViewPointHeightFromTerrain : 0.75
     kViewPointHeightFromTerrainChangeThreshold : 0.6

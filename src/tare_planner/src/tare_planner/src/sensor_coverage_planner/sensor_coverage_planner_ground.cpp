@@ -76,6 +76,27 @@ void SensorCoveragePlanner3D::ReadParameters() {
   this->declare_parameter<int>("kDirectionNoChangeCounterThr", 5);
   this->declare_parameter<int>("kResetWaypointJoystickAxesID", 0);
 
+  // ============================================================
+  // NARROW SPACE DEADLOCK FIX: Declare new safety parameters
+  // ============================================================
+  this->declare_parameter<double>("kMaxExplorationTimeSeconds", 600.0);
+  this->declare_parameter<int>("kStuckCycleThreshold", 50);
+  this->declare_parameter<double>("kProgressDistanceThreshold", 0.5);
+  // ============================================================
+
+  // ============================================================
+  // WAYPOINT DEADLOCK FIX: Declare waypoint timeout parameters
+  // ============================================================
+  this->declare_parameter<double>("kWaypointTimeout", 20.0);
+  this->declare_parameter<int>("kWaypointMaxRetries", 3);
+  // ============================================================
+
+  // ============================================================
+  // REGION BLACKLIST FIX: Declare region blacklist parameters
+  // ============================================================
+  this->declare_parameter<double>("kRegionBlacklistRadius", 2.0);
+  this->declare_parameter<int>("kRegionBlacklistMaxSize", 10);
+  this->declare_parameter<int>("kRegionBlacklistMaxRetries", 5);
   // grid_world
   this->declare_parameter<int>("kGridWorldXNum", 121);
   this->declare_parameter<int>("kGridWorldYNum", 121);
@@ -232,6 +253,37 @@ void SensorCoveragePlanner3D::ReadParameters() {
                       kDirectionNoChangeCounterThr);
   this->get_parameter("kResetWaypointJoystickAxesID",
                       kResetWaypointJoystickAxesID);
+
+  // ============================================================
+  // NARROW SPACE DEADLOCK FIX: Read new safety parameters
+  // ============================================================
+  this->get_parameter("kMaxExplorationTimeSeconds", kMaxExplorationTimeSeconds);
+  this->get_parameter("kStuckCycleThreshold", kStuckCycleThreshold);
+  this->get_parameter("kProgressDistanceThreshold", kProgressDistanceThreshold);
+  std::cout << "parameter kMaxExplorationTimeSeconds: " << kMaxExplorationTimeSeconds << std::endl;
+  std::cout << "parameter kStuckCycleThreshold: " << kStuckCycleThreshold << std::endl;
+  std::cout << "parameter kProgressDistanceThreshold: " << kProgressDistanceThreshold << std::endl;
+  // ============================================================
+
+  // ============================================================
+  // WAYPOINT DEADLOCK FIX: Read waypoint timeout parameters
+  // ============================================================
+  this->get_parameter("kWaypointTimeout", kWaypointTimeout);
+  this->get_parameter("kWaypointMaxRetries", kWaypointMaxRetries);
+  std::cout << "parameter kWaypointTimeout: " << kWaypointTimeout << " seconds" << std::endl;
+  std::cout << "parameter kWaypointMaxRetries: " << kWaypointMaxRetries << std::endl;
+  // ============================================================
+
+  // ============================================================
+  // REGION BLACKLIST FIX: Read region blacklist parameters
+  // ============================================================
+  this->get_parameter("kRegionBlacklistRadius", kRegionBlacklistRadius);
+  this->get_parameter("kRegionBlacklistMaxSize", kRegionBlacklistMaxSize);
+  this->get_parameter("kRegionBlacklistMaxRetries", kRegionBlacklistMaxRetries);
+  std::cout << "parameter kRegionBlacklistRadius: " << kRegionBlacklistRadius << " meters" << std::endl;
+  std::cout << "parameter kRegionBlacklistMaxSize: " << kRegionBlacklistMaxSize << std::endl;
+  std::cout << "parameter kRegionBlacklistMaxRetries: " << kRegionBlacklistMaxRetries << std::endl;
+  // ============================================================
 }
 
 // PlannerData::PlannerData()
@@ -365,7 +417,17 @@ SensorCoveragePlanner3D::SensorCoveragePlanner3D()
       use_momentum_(false), lookahead_point_in_line_of_sight_(true),
       reset_waypoint_(false), registered_cloud_count_(0), keypose_count_(0),
       direction_change_count_(0), direction_no_change_count_(0),
-      momentum_activation_count_(0), reset_waypoint_joystick_axis_value_(-1.0) {
+      momentum_activation_count_(0), reset_waypoint_joystick_axis_value_(0.0),
+      stuck_cycle_count_(0),
+      last_progress_position_(Eigen::Vector3d::Zero()), last_progress_time_(0.0),
+      current_waypoint_position_(Eigen::Vector3d::Zero()),
+      waypoint_last_update_time_(0.0), waypoint_retry_count_(0),
+      waypoint_stuck_(false),
+      total_traveling_distance_(0.0),
+      watchdog_lookahead_point_(Eigen::Vector3d::Zero()),
+      watchdog_timer_start_(0.0),
+      watchdog_initialized_(false),
+      watchdog_timeout_triggered_(false) {
   std::cout << "finished constructor" << std::endl;
 }
 
@@ -458,6 +520,16 @@ bool SensorCoveragePlanner3D::initialize() {
       this->create_publisher<std_msgs::msg::Float32>(pub_runtime_topic_, 2);
   momentum_activation_count_pub_ = this->create_publisher<std_msgs::msg::Int32>(
       pub_momentum_activation_count_topic_, 2);
+
+  // ============================================================
+  // EXPLORATION METRICS: Create publishers for real-time plotting
+  // ============================================================
+  explored_volume_pub_ = this->create_publisher<std_msgs::msg::Float32>("/explored_volume", 2);
+  traveling_distance_pub_ = this->create_publisher<std_msgs::msg::Float32>("/traveling_distance", 2);
+  time_duration_pub_ = this->create_publisher<std_msgs::msg::Float32>("/time_duration", 2);
+  total_traveling_distance_ = 0.0;
+  // ============================================================
+
   // Debug
   pointcloud_manager_neighbor_cells_origin_pub_ =
       this->create_publisher<geometry_msgs::msg::PointStamped>(
@@ -1348,6 +1420,8 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
 
 void SensorCoveragePlanner3D::PublishWaypoint() {
   geometry_msgs::msg::PointStamped waypoint;
+  double r = 0.0;
+
   if (exploration_finished_ && near_home_ && kRushHome) {
     waypoint.point.x = initial_position_.x();
     waypoint.point.y = initial_position_.y();
@@ -1355,7 +1429,7 @@ void SensorCoveragePlanner3D::PublishWaypoint() {
   } else {
     double dx = lookahead_point_.x() - robot_position_.x;
     double dy = lookahead_point_.y() - robot_position_.y;
-    double r = sqrt(dx * dx + dy * dy);
+    r = sqrt(dx * dx + dy * dy);
     double extend_dist = lookahead_point_in_line_of_sight_
                              ? kExtendWayPointDistanceBig
                              : kExtendWayPointDistanceSmall;
@@ -1367,6 +1441,74 @@ void SensorCoveragePlanner3D::PublishWaypoint() {
     waypoint.point.y = dy + robot_position_.y;
     waypoint.point.z = lookahead_point_.z();
   }
+
+  // ============================================================
+  // REGION BLACKLIST: Check if waypoint is in blacklisted region
+  // ============================================================
+  Eigen::Vector3d waypoint_pos(waypoint.point.x, waypoint.point.y,
+                                waypoint.point.z);
+
+  bool redirected = false;
+  for (int redirect_attempt = 0; redirect_attempt < 3; redirect_attempt++) {
+    bool in_blacklist = false;
+    for (size_t i = 0; i < blacklist_regions_.size(); i++) {
+      double dist_to_blacklist = (waypoint_pos - blacklist_regions_[i]).norm();
+      if (dist_to_blacklist < kRegionBlacklistRadius) {
+        in_blacklist = true;
+        break;
+      }
+    }
+
+    if (!in_blacklist) {
+      break;
+    }
+
+    // This waypoint is in a blacklisted region - redirect
+    RCLCPP_WARN(rclcpp::get_logger("standalone_logger"),
+                "REGION BLACKLIST: Redirect attempt %d - waypoint at (%.2f, %.2f) "
+                "is in blacklisted region.",
+                redirect_attempt + 1, waypoint.point.x, waypoint.point.y);
+
+    Eigen::Vector3d to_waypoint = waypoint_pos - Eigen::Vector3d(robot_position_.x, robot_position_.y, robot_position_.z);
+    to_waypoint.z() = 0;
+    if (to_waypoint.norm() > 0.1) {
+      to_waypoint.normalize();
+      double angle_offset = (redirect_attempt * 0.5) + 1.5708;
+      Eigen::Vector3d perpendicular(
+          -to_waypoint.y() * cos(angle_offset) + to_waypoint.x() * sin(angle_offset),
+          to_waypoint.x() * cos(angle_offset) + to_waypoint.y() * sin(angle_offset),
+          0);
+      perpendicular.normalize();
+      double alternative_distance = std::min(r, 3.0);
+
+      waypoint.point.x = robot_position_.x + perpendicular.x() * alternative_distance;
+      waypoint.point.y = robot_position_.y + perpendicular.y() * alternative_distance;
+      waypoint.point.z = lookahead_point_.z();
+
+      waypoint_pos = Eigen::Vector3d(waypoint.point.x, waypoint.point.y,
+                                      waypoint.point.z);
+      redirected = true;
+    } else {
+      break;
+    }
+  }
+
+  // If all directions are blacklisted, force exploration to finish
+  if (redirected) {
+    bool still_in_blacklist = false;
+    for (size_t i = 0; i < blacklist_regions_.size(); i++) {
+      if ((waypoint_pos - blacklist_regions_[i]).norm() < kRegionBlacklistRadius) {
+        still_in_blacklist = true;
+        break;
+      }
+    }
+    if (still_in_blacklist) {
+      RCLCPP_ERROR(rclcpp::get_logger("standalone_logger"),
+                  "REGION BLACKLIST: ALL directions blacklisted! Forcing exploration finish.");
+      exploration_finished_ = true;
+    }
+  }
+
   misc_utils_ns::Publish(shared_from_this(), waypoint_pub_, waypoint,
                          kWorldFrameID);
 }
@@ -1398,6 +1540,37 @@ void SensorCoveragePlanner3D::PublishRuntime() {
   std_msgs::msg::Float32 runtime_msg;
   runtime_msg.data = runtime / 1000.0;
   runtime_pub_->publish(runtime_msg);
+}
+
+void SensorCoveragePlanner3D::PublishExplorationMetrics() {
+  // Calculate explored volume based on keypose cloud points and grid resolution
+  // Volume = number_of_points * grid_resolution^3
+  double explored_volume = 0.0;
+
+  // Method 1: Estimate from keypose count (each keypose represents a scan)
+  // Average scan coverage is approximately 12m range, 360 degrees
+  // Volume per scan ≈ π * range^2 * height ≈ 3.14 * 12^2 * 1.5 ≈ 680 m³
+  // But we need to account for overlap, so use a discount factor
+  double volume_per_keypose = 3.14159 * 12.0 * 12.0 * 1.5 * 0.3;  // ~203 m³ with overlap discount
+  explored_volume = keypose_count_ * volume_per_keypose;
+
+  // Publish explored volume
+  std_msgs::msg::Float32 explored_volume_msg;
+  explored_volume_msg.data = explored_volume;
+  explored_volume_pub_->publish(explored_volume_msg);
+
+  // Publish traveling distance (cumulative)
+  // This is updated in the main loop when robot moves
+  std_msgs::msg::Float32 traveling_distance_msg;
+  traveling_distance_msg.data = total_traveling_distance_;
+  traveling_distance_pub_->publish(traveling_distance_msg);
+
+  // Publish time duration
+  double current_time = this->now().seconds();
+  double time_duration = current_time - start_time_;
+  std_msgs::msg::Float32 time_duration_msg;
+  time_duration_msg.data = time_duration;
+  time_duration_pub_->publish(time_duration_msg);
 }
 
 double SensorCoveragePlanner3D::GetRobotToHomeDistance() {
@@ -1530,6 +1703,16 @@ void SensorCoveragePlanner3D::execute() {
     double current_time = this->now().seconds();
     double delta_time = current_time - start_time_;
 
+    // Global time limit (exploration overall) - keep this as-is
+    if (!exploration_finished_ && delta_time >= kMaxExplorationTimeSeconds) {
+        RCLCPP_WARN(rclcpp::get_logger("standalone_logger"),
+                    "MAX EXPLORATION TIME REACHED: %.1f seconds (threshold: %.1f). "
+                    "Forcing exploration finish.",
+                    delta_time, kMaxExplorationTimeSeconds);
+        exploration_finished_ = true;
+    }
+    // ============================================================
+
     if (grid_world_->IsReturningHome() &&
         local_coverage_planner_->IsLocalCoverageComplete() &&
         (current_time - start_time_) > 5) {
@@ -1548,8 +1731,111 @@ void SensorCoveragePlanner3D::execute() {
 
     PublishExplorationState();
 
+    // Get new lookahead point from TARE
     lookahead_point_update_ =
         GetLookAheadPoint(exploration_path_, global_path, lookahead_point_);
+
+    // ============================================================
+    // ABSOLUTE WATCHDOG: HIGHEST PRIORITY - Runs AFTER GetLookAheadPoint
+    // This watchdog tracks the LOOKAHEAD POINT (from TARE), not robot position.
+    // It fires AFTER TARE generates a waypoint, checks if we've been stuck on
+    // the same lookahead for too long, and if so, FORCES lookahead_point_
+    // to a different value to break the deadlock.
+    // ============================================================
+
+    double current_time_watchdog = this->now().seconds();
+
+    // Initialize watchdog on first call
+    if (!watchdog_initialized_) {
+        watchdog_lookahead_point_ = lookahead_point_;
+        watchdog_timer_start_ = current_time_watchdog;
+        watchdog_initialized_ = true;
+        RCLCPP_INFO(this->get_logger(),
+                    "ABSOLUTE WATCHDOG INITIALIZED: Tracking lookahead at (%.2f, %.2f, %.2f)",
+                    lookahead_point_.x(), lookahead_point_.y(), lookahead_point_.z());
+    }
+
+    // Check if TARE has generated a NEW lookahead point
+    double lookahead_change_dist = (lookahead_point_ - watchdog_lookahead_point_).norm();
+
+    if (lookahead_change_dist > 0.3) {
+        // TARE generated a new waypoint -> reset watchdog
+        watchdog_lookahead_point_ = lookahead_point_;
+        watchdog_timer_start_ = current_time_watchdog;
+        watchdog_timeout_triggered_ = false;
+        RCLCPP_INFO(this->get_logger(),
+                    "ABSOLUTE WATCHDOG: New lookahead detected. Timer reset. "
+                    "New target: (%.2f, %.2f, %.2f)",
+                    lookahead_point_.x(), lookahead_point_.y(), lookahead_point_.z());
+    }
+
+    // Calculate elapsed time on current lookahead
+    double watchdog_elapsed = current_time_watchdog - watchdog_timer_start_;
+
+    // CRITICAL: Absolute timeout - fires regardless of robot movement
+    if (!watchdog_timeout_triggered_ && watchdog_elapsed > kWaypointTimeout) {
+        watchdog_timeout_triggered_ = true;
+
+        RCLCPP_ERROR(this->get_logger(), "==========================================================");
+        RCLCPP_ERROR(this->get_logger(),
+                    "ABSOLUTE WATCHDOG TIMEOUT FIRED!");
+        RCLCPP_ERROR(this->get_logger(),
+                    "  Elapsed: %.1f s > Threshold: %.1f s",
+                    watchdog_elapsed, kWaypointTimeout);
+        RCLCPP_ERROR(this->get_logger(),
+                    "  TARE stuck sending same lookahead point!");
+        RCLCPP_ERROR(this->get_logger(),
+                    "  Lookahead: (%.2f, %.2f, %.2f)",
+                    watchdog_lookahead_point_.x(), watchdog_lookahead_point_.y(),
+                    watchdog_lookahead_point_.z());
+        RCLCPP_ERROR(this->get_logger(),
+                    "  Robot:     (%.2f, %.2f, %.2f)",
+                    robot_position_.x, robot_position_.y, robot_position_.z);
+        RCLCPP_ERROR(this->get_logger(), "==========================================================");
+        RCLCPP_ERROR(this->get_logger(),
+                    "ACTION: Forcing lookahead_point_ to robot position to trigger re-plan!");
+
+        // FORCIBLY override lookahead_point_ to break deadlock
+        // This will cause TARE to generate a new waypoint on next cycle
+        lookahead_point_ = Eigen::Vector3d(robot_position_.x, robot_position_.y,
+                                            robot_position_.z);
+
+        // Add stuck region to permanent blacklist
+        Eigen::Vector3d stuck_region_center = watchdog_lookahead_point_;
+        bool already_blacklisted = false;
+        for (size_t i = 0; i < blacklist_regions_.size(); i++) {
+            double dist = (stuck_region_center - blacklist_regions_[i]).norm();
+            if (dist < kRegionBlacklistRadius) {
+                already_blacklisted = true;
+                blacklist_retry_counts_[i] = kRegionBlacklistMaxRetries;
+                break;
+            }
+        }
+
+        if (!already_blacklisted && blacklist_regions_.size() < (size_t)kRegionBlacklistMaxSize) {
+            blacklist_regions_.push_back(stuck_region_center);
+            blacklist_retry_counts_.push_back(kRegionBlacklistMaxRetries);
+            blacklist_timestamps_.push_back(current_time_watchdog);
+            RCLCPP_ERROR(this->get_logger(),
+                        "REGION BLACKLIST: Added PERMANENT region at (%.2f, %.2f, %.2f). "
+                        "Radius: %.2f m. Total: %zu",
+                        stuck_region_center.x(), stuck_region_center.y(),
+                        stuck_region_center.z(), kRegionBlacklistRadius,
+                        blacklist_regions_.size());
+        }
+
+        // Reset watchdog
+        watchdog_timer_start_ = current_time_watchdog;
+        watchdog_lookahead_point_ = lookahead_point_;
+
+        RCLCPP_ERROR(this->get_logger(),
+                    "ABSOLUTE WATCHDOG: lookahead_point_ overridden. "
+                    "TARE will generate new waypoint next cycle.");
+        RCLCPP_ERROR(this->get_logger(), "==========================================================");
+    }
+    // ============================================================
+
+    // Publish the waypoint (may be overridden by watchdog above)
     PublishWaypoint();
 
     overall_processing_timer.Stop(false);
@@ -1564,6 +1850,19 @@ void SensorCoveragePlanner3D::execute() {
     PublishLocalPlanningVisualization(local_path);
     PublishGlobalPlanningVisualization(global_path, local_path);
     PublishRuntime();
+
+    // ============================================================
+    // EXPLORATION METRICS: Update and publish exploration metrics
+    // ============================================================
+    static Eigen::Vector3d last_metric_position(robot_position_.x, robot_position_.y, robot_position_.z);
+    double movement_distance = (Eigen::Vector3d(robot_position_.x, robot_position_.y, robot_position_.z) -
+                               last_metric_position).norm();
+    if (movement_distance > 0.01) {
+      total_traveling_distance_ += movement_distance;
+      last_metric_position = Eigen::Vector3d(robot_position_.x, robot_position_.y, robot_position_.z);
+    }
+    PublishExplorationMetrics();
+    // ============================================================
   }
 }
 } // namespace sensor_coverage_planner_3d_ns

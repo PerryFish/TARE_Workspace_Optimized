@@ -116,6 +116,32 @@ private:
   int kDirectionNoChangeCounterThr;
   int kResetWaypointJoystickAxesID;
 
+  // ============================================================
+  // NARROW SPACE DEADLOCK FIX: New safety parameters
+  // ============================================================
+  double kMaxExplorationTimeSeconds;
+  int kStuckCycleThreshold;
+  double kProgressDistanceThreshold;
+  // ============================================================
+
+  // ============================================================
+  // WAYPOINT DEADLOCK FIX: Waypoint timeout parameters
+  // ============================================================
+  double kWaypointTimeout;
+  int kWaypointMaxRetries;
+  // ============================================================
+
+  // ============================================================
+  // REGION BLACKLIST FIX: Region-level blacklist for unreachable areas
+  // ============================================================
+  double kRegionBlacklistRadius;
+  int kRegionBlacklistMaxSize;
+  int kRegionBlacklistMaxRetries;
+  std::vector<Eigen::Vector3d> blacklist_regions_;
+  std::vector<int> blacklist_retry_counts_;
+  std::vector<double> blacklist_timestamps_;
+  // ============================================================
+
   std::shared_ptr<pointcloud_utils_ns::PCLCloud<PlannerCloudPointType>>
       keypose_cloud_;
   std::shared_ptr<pointcloud_utils_ns::PCLCloud<pcl::PointXYZ>>
@@ -207,6 +233,31 @@ private:
   int direction_no_change_count_;
   int momentum_activation_count_;
 
+  // ============================================================
+  // NARROW SPACE DEADLOCK FIX: New state variables
+  // ============================================================
+  int stuck_cycle_count_;
+  Eigen::Vector3d last_progress_position_;
+  double last_progress_time_;
+  // ============================================================
+
+  // ============================================================
+  // WAYPOINT DEADLOCK FIX: Waypoint timeout tracking
+  // ============================================================
+  Eigen::Vector3d current_waypoint_position_;
+  double waypoint_last_update_time_;
+  int waypoint_retry_count_;
+  bool waypoint_stuck_;
+
+  // ============================================================
+  // ABSOLUTE WATCHDOG FIX: Track lookahead_point changes (not robot position)
+  // ============================================================
+  Eigen::Vector3d watchdog_lookahead_point_;
+  double watchdog_timer_start_;
+  bool watchdog_initialized_;
+  bool watchdog_timeout_triggered_;
+  // ============================================================
+
   double start_time_;
   double global_direction_switch_time_;
   double reset_waypoint_joystick_axis_value_;
@@ -247,6 +298,16 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr runtime_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr
       momentum_activation_count_pub_;
+
+  // ============================================================
+  // EXPLORATION METRICS: Publishers for real-time plotting
+  // ============================================================
+  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr explored_volume_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr traveling_distance_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr time_duration_pub_;
+  double total_traveling_distance_;
+  // ============================================================
+
   // Debug
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr
       pointcloud_manager_neighbor_cells_origin_pub_;
@@ -299,6 +360,7 @@ private:
       const exploration_path_ns::ExplorationPath &local_path);
 
   void PublishRuntime();
+  void PublishExplorationMetrics();  // NEW: For real-time plotting
   double GetRobotToHomeDistance();
   void PublishExplorationState();
   void PublishWaypoint();

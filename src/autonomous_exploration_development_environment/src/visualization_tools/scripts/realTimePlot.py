@@ -1,156 +1,290 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib as mpl
+"""
+realTimePlot.py - Real-time visualization for TARE exploration metrics
+Compatible with ROS 2 Humble
+
+Subscribes to:
+  - /explored_volume     (std_msgs/Float32): Total explored volume in m^3
+  - /traveling_distance  (std_msgs/Float32): Cumulative traveling distance in m
+  - /time_duration       (std_msgs/Float32): Elapsed time since start in s
+  - /runtime             (std_msgs/Float32): Algorithm processing time per cycle in s
+
+Usage:
+  ros2 run visualization_tools realTimePlot.py
+
+  Or with remapping if topic names differ:
+  ros2 run visualization_tools realTimePlot.py --ros-args -r /explored_volume:=/tare/explored_volume
+"""
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import sys
+import threading
+import time
 
-mpl.rcParams['toolbar'] = 'None'
-plt.ion()
 
-time_duration = 0
-start_time_duration = 0
-first_iteration = 'True'
-
-explored_volume = 0
-traveling_distance = 0
-run_time = 0
-max_explored_volume = 0
-max_traveling_diatance = 0
-max_run_time = 0
-
-time_list1 = np.array([])
-time_list2 = np.array([])
-time_list3 = np.array([])
-run_time_list = np.array([])
-explored_volume_list = np.array([])
-traveling_distance_list = np.array([])
-
-def timeDurationCallback(msg):
-    global time_duration, start_time_duration, first_iteration
-    time_duration = msg.data
-    if first_iteration == 'True':
-        start_time_duration = time_duration
-        first_iteration = 'False'
-
-def runTimeCallback(msg):
-    global run_time
-    run_time = msg.data
-
-def exploredVolumeCallback(msg):
-    global explored_volume
-    explored_volume = msg.data
-
-def travelingDistanceCallback(msg):
-    global traveling_distance
-    traveling_distance = msg.data
-
-class Listener(Node):
-
+class RealTimePlotNode(Node):
     def __init__(self):
-        global time_duration, start_time_duration, explored_volume, traveling_distance, run_time, max_explored_volume, max_traveling_diatance, max_run_time, time_list1, time_list2, time_list3, run_time_list, explored_volume_list, traveling_distance_list
-        super().__init__('realTimePlot')
+        super().__init__('real_time_plot')
 
-        self.fig=plt.figure(figsize=(8,7))
-        self.fig1=self.fig.add_subplot(311)
-        plt.title("Exploration Metrics\n", fontsize=14)
-        plt.margins(x=0.001)
-        self.fig1.set_ylabel("Explored\nVolume (m$^3$)", fontsize=12)
-        self.l1, = self.fig1.plot(time_list2, explored_volume_list, color='r', label='Explored Volume')
-        self.fig2=self.fig.add_subplot(312)
-        self.fig2.set_ylabel("Traveling\nDistance (m)", fontsize=12)
-        self.l2, = self.fig2.plot(time_list3, traveling_distance_list, color='r', label='Traveling Distance')
-        self.fig3=self.fig.add_subplot(313)
-        self.fig3.set_ylabel("Algorithm\nRuntime (s)", fontsize=12)
-        self.fig3.set_xlabel("Time Duration (s)", fontsize=12) #only set once
-        self.l3, = self.fig3.plot(time_list1, run_time_list, color='r', label='Algorithm Runtime')
+        # Data storage
+        self.time_data = []
+        self.explored_volume_data = []
+        self.traveling_distance_data = []
+        self.runtime_data = []
 
-        self.fig.canvas.draw()
+        self.explored_volume = 0.0
+        self.traveling_distance = 0.0
+        self.time_duration = 0.0
+        self.runtime = 0.0
 
-        self.count = 0
+        self.start_time_set = False
+        self.start_time_value = 0.0
 
-        self.time_duration_subscription = self.create_subscription(
+        # Graceful shutdown flags
+        self.shutdown_requested = False
+        self.spin_thread = None
+
+        self.get_logger().info('RealTimePlot node started, waiting for data...')
+
+        # Create subscriptions
+        self.create_subscription(
             Float32,
             '/time_duration',
-            timeDurationCallback,
-            10)
-        self.time_duration_subscription  # prevent unused variable warning 
+            self.time_duration_callback,
+            10
+        )
 
-        self.runtime_subscription = self.create_subscription(
+        self.create_subscription(
             Float32,
             '/runtime',
-            runTimeCallback,
-            10)
-        self.runtime_subscription  # prevent unused variable warning 
+            self.runtime_callback,
+            10
+        )
 
-        self.explored_volume_subscription = self.create_subscription(
+        self.create_subscription(
             Float32,
             '/explored_volume',
-            exploredVolumeCallback,
-            10)
-        self.explored_volume_subscription  
+            self.explored_volume_callback,
+            10
+        )
 
-        self.traveling_distance_subscription = self.create_subscription(
+        self.create_subscription(
             Float32,
             '/traveling_distance',
-            travelingDistanceCallback,
-            10)
-        self.traveling_distance_subscription  
+            self.traveling_distance_callback,
+            10
+        )
 
-        timer_period = 0.01  # 100hz 
-        self.timer = self.create_timer(timer_period, self.plot_callback)
+        # Create matplotlib figure
+        self.setup_plot()
 
-    def plot_callback(self):
-        global time_duration, start_time_duration, explored_volume, traveling_distance, run_time, max_explored_volume, max_traveling_diatance, max_run_time, time_list1, time_list2, time_list3, run_time_list, explored_volume_list, traveling_distance_list
-        self.count = self.count + 1
+        # Connect window close event for graceful shutdown
+        self.fig.canvas.mpl_connect('close_event', self.on_figure_close)
 
-        if self.count % 25 == 0:
-            max_explored_volume = explored_volume
-            max_traveling_diatance = traveling_distance
-            if run_time > max_run_time:
-                max_run_time = run_time
+        # Start spin thread
+        self.spin_thread = threading.Thread(target=self.spin_loop, daemon=True)
+        self.spin_thread.start()
 
-            time_list2 = np.append(time_list2, time_duration)
-            explored_volume_list = np.append(explored_volume_list, explored_volume)
-            time_list3 = np.append(time_list3, time_duration)
-            traveling_distance_list = np.append(traveling_distance_list, traveling_distance)
-            time_list1 = np.append(time_list1, time_duration)
-            run_time_list = np.append(run_time_list, run_time)
+        # Animation timer - update plot at 10Hz
+        self.ani = FuncAnimation(
+            self.fig,
+            self.update_plot,
+            interval=100,
+            blit=False
+        )
 
-        if self.count >= 100:
-            self.count = 0
-            self.l1.set_xdata(time_list2)
-            self.l2.set_xdata(time_list3)
-            self.l3.set_xdata(time_list1)
-            self.l1.set_ydata(explored_volume_list)
-            self.l2.set_ydata(traveling_distance_list)
-            self.l3.set_ydata(run_time_list)
+        plt.show()
 
-            self.fig1.set_ylim(0, max_explored_volume + 500)
-            self.fig1.set_xlim(start_time_duration, time_duration + 10)
-            self.fig2.set_ylim(0, max_traveling_diatance + 20)
-            self.fig2.set_xlim(start_time_duration, time_duration + 10)
-            self.fig3.set_ylim(0, max_run_time + 0.2)
-            self.fig3.set_xlim(start_time_duration, time_duration + 10)
+    def spin_loop(self):
+        """Background thread for ROS spinning."""
+        executor = rclpy.executors.SingleThreadedExecutor()
+        executor.add_node(self)
 
-            self.fig.canvas.draw()
-            plt.pause(0.01)
+        while rclpy.ok() and not self.shutdown_requested:
+            executor.spin_once(timeout_sec=0.01)
+            plt.pause(0.001)
+
+        self.get_logger().info('Spin thread exiting gracefully')
+
+    def on_figure_close(self, event):
+        """Handle matplotlib window close event for graceful shutdown."""
+        self.get_logger().info('Matplotlib window closed, initiating graceful shutdown...')
+        self.shutdown_requested = True
+
+        # Give spin thread time to exit
+        if self.spin_thread is not None and self.spin_thread.is_alive():
+            self.spin_thread.join(timeout=1.0)
+
+        # Shutdown rclpy
+        if rclpy.ok():
+            rclpy.shutdown()
+
+        self.get_logger().info('Graceful shutdown complete')
+
+    def setup_plot(self):
+        """Initialize the matplotlib figure with 3 subplots."""
+        # DEFENSIVE style loading: NEVER let style loading crash the node
+        try:
+            plt.style.use('seaborn-v0_8-whitegrid')
+        except Exception:
+            try:
+                plt.style.use('seaborn-whitegrid')
+            except Exception:
+                try:
+                    plt.style.use('ggplot')
+                except Exception:
+                    plt.style.use('default')
+
+        self.fig, (self.ax1, self.ax2, self.ax3) = plt.subplots(
+            3, 1, figsize=(10, 9), sharex=False
+        )
+        self.fig.canvas.manager.set_window_title('TARE Exploration Metrics')
+        self.fig.tight_layout(rect=[0, 0.08, 1, 0.96])
+
+        # Subplot 1: Explored Volume
+        self.ax1.set_ylabel('Explored Volume (m\u00b3)', fontsize=12)
+        self.ax1.set_title('TARE Exploration Metrics - Real-time Monitoring', fontsize=14, fontweight='bold')
+        self.line1, = self.ax1.plot([], [], color='#E74C3C', linewidth=2, label='Explored Volume')
+        self.ax1.legend(loc='upper left')
+        self.ax1.grid(True, alpha=0.3)
+        self.ax1.set_xlim(0, 60)
+        self.ax1.set_ylim(0, 1000)
+
+        # Subplot 2: Traveling Distance
+        self.ax2.set_ylabel('Traveling Distance (m)', fontsize=12)
+        self.line2, = self.ax2.plot([], [], color='#3498DB', linewidth=2, label='Traveling Distance')
+        self.ax2.legend(loc='upper left')
+        self.ax2.grid(True, alpha=0.3)
+        self.ax2.set_xlim(0, 60)
+        self.ax2.set_ylim(0, 200)
+
+        # Subplot 3: Algorithm Runtime
+        self.ax3.set_ylabel('Runtime (s)', fontsize=12)
+        self.ax3.set_xlabel('Time (s)', fontsize=12)
+        self.line3, = self.ax3.plot([], [], color='#2ECC71', linewidth=2, label='Algorithm Runtime')
+        self.ax3.legend(loc='upper left')
+        self.ax3.grid(True, alpha=0.3)
+        self.ax3.set_xlim(0, 60)
+        self.ax3.set_ylim(0, 5)
+
+        plt.ion()
+        plt.draw()
+        plt.pause(0.01)
+
+    def time_duration_callback(self, msg):
+        """Callback for /time_duration topic."""
+        self.time_duration = msg.data
+        if not self.start_time_set and self.time_duration > 0:
+            self.start_time_value = self.time_duration
+            self.start_time_set = True
+            self.get_logger().info(
+                f'Received first time_duration: {self.time_duration:.2f}s'
+            )
+
+    def runtime_callback(self, msg):
+        """Callback for /runtime topic."""
+        self.runtime = msg.data
+
+    def explored_volume_callback(self, msg):
+        """Callback for /explored_volume topic."""
+        self.explored_volume = msg.data
+
+    def traveling_distance_callback(self, msg):
+        """Callback for /traveling_distance topic."""
+        self.traveling_distance = msg.data
+
+    def update_plot(self, frame):
+        """Update the plot with new data. Called by FuncAnimation."""
+        if not self.start_time_set or self.shutdown_requested:
+            return
+
+        current_time = self.time_duration - self.start_time_value
+        if current_time < 0:
+            return
+
+        # Only update every few frames
+        if len(self.time_data) == 0 or (current_time - self.time_data[-1]) > 0.2:
+            self.time_data.append(current_time)
+            self.explored_volume_data.append(self.explored_volume)
+            self.traveling_distance_data.append(self.traveling_distance)
+            self.runtime_data.append(self.runtime)
+
+        if len(self.time_data) < 2:
+            return
+
+        # Limit data points
+        max_points = 600
+        if len(self.time_data) > max_points:
+            self.time_data = self.time_data[-max_points:]
+            self.explored_volume_data = self.explored_volume_data[-max_points:]
+            self.traveling_distance_data = self.traveling_distance_data[-max_points:]
+            self.runtime_data = self.runtime_data[-max_points:]
+
+        time_arr = np.array(self.time_data)
+        vol_arr = np.array(self.explored_volume_data)
+        dist_arr = np.array(self.traveling_distance_data)
+        rt_arr = np.array(self.runtime_data)
+
+        # Update line data
+        self.line1.set_data(time_arr, vol_arr)
+        self.line2.set_data(time_arr, dist_arr)
+        self.line3.set_data(time_arr, rt_arr)
+
+        # Rescale axes
+        max_time = max(time_arr[-1] + 10, 60) if len(time_arr) > 0 else 60
+
+        self.ax1.set_xlim(0, max_time)
+        self.ax2.set_xlim(0, max_time)
+        self.ax3.set_xlim(0, max_time)
+
+        vol_max = max(np.max(vol_arr) * 1.2 if len(vol_arr) > 0 else 1000, 100)
+        dist_max = max(np.max(dist_arr) * 1.2 if len(dist_arr) > 0 else 200, 20)
+        rt_max = max(np.max(rt_arr) * 1.2 if len(rt_arr) > 0 else 5, 0.5)
+
+        self.ax1.set_ylim(0, vol_max)
+        self.ax2.set_ylim(0, dist_max)
+        self.ax3.set_ylim(0, rt_max)
+
+        # Status text
+        status_text = (
+            f'Time: {current_time:.1f}s  |  '
+            f'Volume: {self.explored_volume:.1f} m\u00b3  |  '
+            f'Distance: {self.traveling_distance:.1f} m  |  '
+            f'Runtime: {self.runtime:.4f} s'
+        )
+        self.fig.suptitle(status_text, fontsize=10, y=0.99)
+
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+
 
 def main(args=None):
-    rclpy.init(args=args)
+    """Main entry point."""
+    try:
+        rclpy.init(args=args)
+        node = RealTimePlotNode()
 
-    listener = Listener()
+        # Main thread will exit when window is closed
+        # Spin thread handles ROS callbacks
 
-    rclpy.spin(listener)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f'Error in realTimePlot: {e}', file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
 
-    # Destroy the node explicitly
-    # (optional - otherwise it will be done automatically
-    # when the garbage collector destroys the node object)
-    listener.destroy_node()
-    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

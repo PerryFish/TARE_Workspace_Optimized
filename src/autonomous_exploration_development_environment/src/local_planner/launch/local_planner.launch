@@ -23,13 +23,13 @@
     <param name="useTerrainAnalysis" value="true" />
     <param name="checkObstacle" value="true" />
     <param name="checkRotObstacle" value="false" />
-    <param name="adjacentRange" value="4.25" />
-    <param name="obstacleHeightThre" value="0.25" />
-    <param name="groundHeightThre" value="0.15" />
+    <param name="adjacentRange" value="3.5" />
+    <param name="obstacleHeightThre" value="0.35" />
+    <param name="groundHeightThre" value="0.2" />
     <param name="costHeightThre" value="0.1" />
-    <param name="costScore" value="0.02" />
+    <param name="costScore" value="0.05" />
     <param name="useCost" value="false" />
-    <param name="pointPerPathThre" value="1" />
+    <param name="pointPerPathThre" value="3" />
     <param name="minRelZ" value="-0.5" />
     <param name="maxRelZ" value="0.3" />
     <param name="maxSpeed" value="$(var maxSpeed)" />

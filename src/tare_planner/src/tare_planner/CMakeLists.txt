@@ -129,6 +129,16 @@ add_executable(tare_planner_node src/tare_planner_node/tare_planner_node.cpp)
 ament_target_dependencies(tare_planner_node rclcpp std_msgs nav_msgs geometry_msgs sensor_msgs tf2_ros tf2_geometry_msgs tf2)
 target_link_libraries(tare_planner_node ${catkin_LIBRARIES} sensor_coverage_planner_ground)
 
+# 3D Trajectory Smoother: B-Spline smoothing of TARE waypoints for drone flight
+add_executable(trajectory_smoother src/trajectory_smoother/trajectory_smoother_node.cpp)
+ament_target_dependencies(trajectory_smoother rclcpp std_msgs nav_msgs geometry_msgs)
+target_link_libraries(trajectory_smoother ${catkin_LIBRARIES} ${EIGEN3_LIBRARIES})
+
+# Mode Manager: Hierarchical dynamic obstacle avoidance state machine
+add_executable(mode_manager src/mode_manager/mode_manager_node.cpp)
+ament_target_dependencies(mode_manager rclcpp std_msgs nav_msgs geometry_msgs sensor_msgs visualization_msgs)
+target_link_libraries(mode_manager ${catkin_LIBRARIES} ${EIGEN3_LIBRARIES})
+
 #############
 ## Install ##
 #############
@@ -136,6 +146,8 @@ target_link_libraries(tare_planner_node ${catkin_LIBRARIES} sensor_coverage_plan
 install(TARGETS
   navigationBoundary
   tare_planner_node
+  trajectory_smoother
+  mode_manager
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch/

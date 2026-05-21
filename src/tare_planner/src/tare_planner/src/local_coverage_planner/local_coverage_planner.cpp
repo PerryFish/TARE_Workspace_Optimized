@@ -20,6 +20,8 @@ bool LocalCoveragePlannerParameter::ReadParameters(rclcpp::Node::SharedPtr nh) {
   nh->get_parameter("kGreedyViewPointSampleRange", kGreedyViewPointSampleRange);
   nh->get_parameter("kLocalPathOptimizationItrMax",
                     kLocalPathOptimizationItrMax);
+  nh->get_parameter("kZAxisTravelCostMultiplier", kZAxisTravelCostMultiplier);
+  nh->get_parameter("kMaxClimbRatePerSegment", kMaxClimbRatePerSegment);
 
   return true;
 }
@@ -363,7 +365,12 @@ exploration_path_ns::ExplorationPath LocalCoveragePlanner::SolveTSP(
       //                                  candidate_viewpoint_position_,
       //                                  from_graph_idx, to_graph_idx, false,
       //                                  tmp);
-      distance_matrix[i][j] = static_cast<int>(10 * path_length);
+      // 3D DRONE: Add Z-axis travel cost penalty to prefer level flight
+      geometry_msgs::msg::Point from_pos = viewpoint_manager_->GetViewPointPosition(from_ind);
+      geometry_msgs::msg::Point to_pos = viewpoint_manager_->GetViewPointPosition(to_ind);
+      double z_delta = std::abs(from_pos.z - to_pos.z);
+      double z_penalty = z_delta * (parameters_.kZAxisTravelCostMultiplier - 1.0);
+      distance_matrix[i][j] = static_cast<int>(10 * (path_length + z_penalty));
     }
   }
 

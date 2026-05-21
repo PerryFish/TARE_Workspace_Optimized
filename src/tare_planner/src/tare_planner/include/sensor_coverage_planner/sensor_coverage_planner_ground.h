@@ -120,15 +120,7 @@ private:
   // NARROW SPACE DEADLOCK FIX: New safety parameters
   // ============================================================
   double kMaxExplorationTimeSeconds;
-  int kStuckCycleThreshold;
-  double kProgressDistanceThreshold;
-  // ============================================================
-
-  // ============================================================
-  // WAYPOINT DEADLOCK FIX: Waypoint timeout parameters
-  // ============================================================
   double kWaypointTimeout;
-  int kWaypointMaxRetries;
   // ============================================================
 
   // ============================================================
@@ -137,6 +129,17 @@ private:
   double kRegionBlacklistRadius;
   int kRegionBlacklistMaxSize;
   int kRegionBlacklistMaxRetries;
+  double kBlacklistExpirationSeconds;
+
+  // ============================================================
+  // 3D DRONE ADAPTATION: New parameters
+  // ============================================================
+  double kZAxisTravelCostMultiplier;
+  double kMaxClimbRatePerSegment;
+  double kViewPointMinHeightFromTerrain;
+  double kViewPointMaxHeightFromTerrain;
+  // ============================================================
+
   std::vector<Eigen::Vector3d> blacklist_regions_;
   std::vector<int> blacklist_retry_counts_;
   std::vector<double> blacklist_timestamps_;
@@ -234,22 +237,6 @@ private:
   int momentum_activation_count_;
 
   // ============================================================
-  // NARROW SPACE DEADLOCK FIX: New state variables
-  // ============================================================
-  int stuck_cycle_count_;
-  Eigen::Vector3d last_progress_position_;
-  double last_progress_time_;
-  // ============================================================
-
-  // ============================================================
-  // WAYPOINT DEADLOCK FIX: Waypoint timeout tracking
-  // ============================================================
-  Eigen::Vector3d current_waypoint_position_;
-  double waypoint_last_update_time_;
-  int waypoint_retry_count_;
-  bool waypoint_stuck_;
-
-  // ============================================================
   // ABSOLUTE WATCHDOG FIX: Track lookahead_point changes (not robot position)
   // ============================================================
   Eigen::Vector3d watchdog_lookahead_point_;
@@ -306,6 +293,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr traveling_distance_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr time_duration_pub_;
   double total_traveling_distance_;
+  Eigen::Vector3d last_metric_position_;  // Track position for travel distance calc
   // ============================================================
 
   // Debug
@@ -361,6 +349,7 @@ private:
 
   void PublishRuntime();
   void PublishExplorationMetrics();  // NEW: For real-time plotting
+  void CleanExpiredBlacklist(double current_time);  // Remove stale blacklist entries
   double GetRobotToHomeDistance();
   void PublishExplorationState();
   void PublishWaypoint();

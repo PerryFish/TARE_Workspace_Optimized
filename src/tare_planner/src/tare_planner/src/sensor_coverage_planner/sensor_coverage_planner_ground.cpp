@@ -80,15 +80,12 @@ void SensorCoveragePlanner3D::ReadParameters() {
   // NARROW SPACE DEADLOCK FIX: Declare new safety parameters
   // ============================================================
   this->declare_parameter<double>("kMaxExplorationTimeSeconds", 600.0);
-  this->declare_parameter<int>("kStuckCycleThreshold", 50);
-  this->declare_parameter<double>("kProgressDistanceThreshold", 0.5);
   // ============================================================
 
   // ============================================================
   // WAYPOINT DEADLOCK FIX: Declare waypoint timeout parameters
   // ============================================================
   this->declare_parameter<double>("kWaypointTimeout", 20.0);
-  this->declare_parameter<int>("kWaypointMaxRetries", 3);
   // ============================================================
 
   // ============================================================
@@ -97,6 +94,7 @@ void SensorCoveragePlanner3D::ReadParameters() {
   this->declare_parameter<double>("kRegionBlacklistRadius", 2.0);
   this->declare_parameter<int>("kRegionBlacklistMaxSize", 10);
   this->declare_parameter<int>("kRegionBlacklistMaxRetries", 5);
+  this->declare_parameter<double>("kBlacklistExpirationSeconds", 120.0);
   // grid_world
   this->declare_parameter<int>("kGridWorldXNum", 121);
   this->declare_parameter<int>("kGridWorldYNum", 121);
@@ -258,23 +256,12 @@ void SensorCoveragePlanner3D::ReadParameters() {
   // NARROW SPACE DEADLOCK FIX: Read new safety parameters
   // ============================================================
   this->get_parameter("kMaxExplorationTimeSeconds", kMaxExplorationTimeSeconds);
-  this->get_parameter("kStuckCycleThreshold", kStuckCycleThreshold);
-  this->get_parameter("kProgressDistanceThreshold", kProgressDistanceThreshold);
-  std::cout << "parameter kMaxExplorationTimeSeconds: " << kMaxExplorationTimeSeconds << std::endl;
-  std::cout << "parameter kStuckCycleThreshold: " << kStuckCycleThreshold << std::endl;
-  std::cout << "parameter kProgressDistanceThreshold: " << kProgressDistanceThreshold << std::endl;
   // ============================================================
 
   // ============================================================
   // WAYPOINT DEADLOCK FIX: Read waypoint timeout parameters
   // ============================================================
   this->get_parameter("kWaypointTimeout", kWaypointTimeout);
-  this->get_parameter("kWaypointMaxRetries", kWaypointMaxRetries);
-  std::cout << "parameter kWaypointTimeout: " << kWaypointTimeout << " seconds" << std::endl;
-  std::cout << "parameter kWaypointMaxRetries: " << kWaypointMaxRetries << std::endl;
-  // ============================================================
-
-  // ============================================================
   // REGION BLACKLIST FIX: Read region blacklist parameters
   // ============================================================
   this->get_parameter("kRegionBlacklistRadius", kRegionBlacklistRadius);
@@ -418,12 +405,8 @@ SensorCoveragePlanner3D::SensorCoveragePlanner3D()
       reset_waypoint_(false), registered_cloud_count_(0), keypose_count_(0),
       direction_change_count_(0), direction_no_change_count_(0),
       momentum_activation_count_(0), reset_waypoint_joystick_axis_value_(0.0),
-      stuck_cycle_count_(0),
-      last_progress_position_(Eigen::Vector3d::Zero()), last_progress_time_(0.0),
-      current_waypoint_position_(Eigen::Vector3d::Zero()),
-      waypoint_last_update_time_(0.0), waypoint_retry_count_(0),
-      waypoint_stuck_(false),
       total_traveling_distance_(0.0),
+      last_metric_position_(Eigen::Vector3d::Zero()),
       watchdog_lookahead_point_(Eigen::Vector3d::Zero()),
       watchdog_timer_start_(0.0),
       watchdog_initialized_(false),
@@ -528,6 +511,7 @@ bool SensorCoveragePlanner3D::initialize() {
   traveling_distance_pub_ = this->create_publisher<std_msgs::msg::Float32>("/traveling_distance", 2);
   time_duration_pub_ = this->create_publisher<std_msgs::msg::Float32>("/time_duration", 2);
   total_traveling_distance_ = 0.0;
+  last_metric_position_ = Eigen::Vector3d::Zero();
   // ============================================================
 
   // Debug
@@ -798,6 +782,40 @@ int SensorCoveragePlanner3D::UpdateViewPoints() {
   viewpoint_manager_->CheckViewPointLineOfSight();
   viewpoint_manager_->CheckViewPointConnectivity();
   int viewpoint_candidate_count = viewpoint_manager_->GetViewPointCandidate();
+
+  // ============================================================
+  // BUG FIX: Blacklist filtering at planning source
+  // Filter candidate viewpoints against blacklisted regions BEFORE
+  // TSP planning to avoid wasting computation on unreachable areas.
+  // ============================================================
+  if (!blacklist_regions_.empty()) {
+    std::vector<int> candidate_indices = viewpoint_manager_->GetViewPointCandidateIndices();
+    int filtered_count = 0;
+    for (int idx : candidate_indices) {
+      geometry_msgs::msg::Point vp_pos = viewpoint_manager_->GetViewPointPosition(idx, true);
+      for (const auto& bl_region : blacklist_regions_) {
+        double dx = vp_pos.x - bl_region.x();
+        double dy = vp_pos.y - bl_region.y();
+        double dz = vp_pos.z - bl_region.z();
+        double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+        if (dist < kRegionBlacklistRadius) {
+          // Mark as visited to exclude from planning pipeline
+          viewpoint_manager_->SetViewPointVisited(idx, true, true);
+          filtered_count++;
+          break;  // Only need one blacklist match
+        }
+      }
+    }
+    if (filtered_count > 0) {
+      // Recompute candidate count after filtering
+      viewpoint_candidate_count = viewpoint_manager_->GetViewPointCandidate();
+      RCLCPP_INFO(this->get_logger(),
+                  "BLACKLIST FILTER: Excluded %d viewpoints in blacklisted regions. "
+                  "Remaining candidates: %d",
+                  filtered_count, viewpoint_candidate_count);
+    }
+  }
+  // ============================================================
 
   UpdateVisitedPositions();
   viewpoint_manager_->UpdateViewPointVisited(visited_positions_);
@@ -1418,6 +1436,33 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
   return true;
 }
 
+void SensorCoveragePlanner3D::CleanExpiredBlacklist(double current_time) {
+  // Remove blacklist entries older than kBlacklistExpirationSeconds
+  if (kBlacklistExpirationSeconds <= 0.0 || blacklist_regions_.empty()) {
+    return;
+  }
+  size_t write_idx = 0;
+  for (size_t i = 0; i < blacklist_regions_.size(); i++) {
+    double age = current_time - blacklist_timestamps_[i];
+    if (age < kBlacklistExpirationSeconds) {
+      if (write_idx != i) {
+        blacklist_regions_[write_idx] = blacklist_regions_[i];
+        blacklist_retry_counts_[write_idx] = blacklist_retry_counts_[i];
+        blacklist_timestamps_[write_idx] = blacklist_timestamps_[i];
+      }
+      write_idx++;
+    } else {
+      RCLCPP_INFO(this->get_logger(),
+                  "BLACKLIST EXPIRATION: Removed region at (%.2f, %.2f, %.2f). Age: %.1f s > %.1f s",
+                  blacklist_regions_[i].x(), blacklist_regions_[i].y(), blacklist_regions_[i].z(),
+                  age, kBlacklistExpirationSeconds);
+    }
+  }
+  blacklist_regions_.resize(write_idx);
+  blacklist_retry_counts_.resize(write_idx);
+  blacklist_timestamps_.resize(write_idx);
+}
+
 void SensorCoveragePlanner3D::PublishWaypoint() {
   geometry_msgs::msg::PointStamped waypoint;
   double r = 0.0;
@@ -1445,6 +1490,9 @@ void SensorCoveragePlanner3D::PublishWaypoint() {
   // ============================================================
   // REGION BLACKLIST: Check if waypoint is in blacklisted region
   // ============================================================
+  // Purge expired entries before checking
+  double current_time = this->now().seconds();
+  CleanExpiredBlacklist(current_time);
   Eigen::Vector3d waypoint_pos(waypoint.point.x, waypoint.point.y,
                                 waypoint.point.z);
 
@@ -1800,6 +1848,9 @@ void SensorCoveragePlanner3D::execute() {
         lookahead_point_ = Eigen::Vector3d(robot_position_.x, robot_position_.y,
                                             robot_position_.z);
 
+        // Purge expired entries before adding new region
+        CleanExpiredBlacklist(current_time_watchdog);
+
         // Add stuck region to permanent blacklist
         Eigen::Vector3d stuck_region_center = watchdog_lookahead_point_;
         bool already_blacklisted = false;
@@ -1854,12 +1905,15 @@ void SensorCoveragePlanner3D::execute() {
     // ============================================================
     // EXPLORATION METRICS: Update and publish exploration metrics
     // ============================================================
-    static Eigen::Vector3d last_metric_position(robot_position_.x, robot_position_.y, robot_position_.z);
+    // Initialize on first call with current robot position
+    if (last_metric_position_.isZero(1e-9)) {
+      last_metric_position_ = Eigen::Vector3d(robot_position_.x, robot_position_.y, robot_position_.z);
+    }
     double movement_distance = (Eigen::Vector3d(robot_position_.x, robot_position_.y, robot_position_.z) -
-                               last_metric_position).norm();
+                               last_metric_position_).norm();
     if (movement_distance > 0.01) {
       total_traveling_distance_ += movement_distance;
-      last_metric_position = Eigen::Vector3d(robot_position_.x, robot_position_.y, robot_position_.z);
+      last_metric_position_ = Eigen::Vector3d(robot_position_.x, robot_position_.y, robot_position_.z);
     }
     PublishExplorationMetrics();
     // ============================================================

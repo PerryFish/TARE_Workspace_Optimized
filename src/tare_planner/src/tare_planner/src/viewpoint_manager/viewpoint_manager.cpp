@@ -58,9 +58,15 @@ bool ViewPointManagerParameter::ReadParameters(rclcpp::Node::SharedPtr nh)
         ceil((kNumber(i) * kResolution(i) + kViewPointCollisionMargin * 2) / kCollisionGridResolution(i));
   }
 
-  kVerticalFOVRatio = tan(M_PI / 15);
+  // Use configurable vertical FOV half-angle (degrees) instead of hardcoded 12°
+  // Default 30° half-angle suits drone-mounted 360° LiDAR / depth cameras
+  nh->declare_parameter<double>("kVerticalFOVHalfAngleDeg", 30.0);
+  double vertical_fov_half_angle_deg;
+  nh->get_parameter("kVerticalFOVHalfAngleDeg", vertical_fov_half_angle_deg);
+  double vertical_fov_half_angle_rad = vertical_fov_half_angle_deg * M_PI / 180.0;
+  kVerticalFOVRatio = tan(vertical_fov_half_angle_rad);
   kDiffZMax = kSensorRange * kVerticalFOVRatio;
-  kInFovXYDistThreshold = 3 * (kCoveragePointCloudResolution / 2) / tan(M_PI / 15);
+  kInFovXYDistThreshold = 3 * (kCoveragePointCloudResolution / 2) / tan(vertical_fov_half_angle_rad);
   kInFovZDiffThreshold = 3 * kCoveragePointCloudResolution;
 
   return true;

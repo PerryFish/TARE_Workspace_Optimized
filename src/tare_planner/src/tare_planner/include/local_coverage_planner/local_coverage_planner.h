@@ -28,6 +28,10 @@ struct LocalCoveragePlannerParameter
   int kGreedyViewPointSampleRange;
   int kLocalPathOptimizationItrMax;
 
+  // 3D DRONE: Z-axis travel cost penalty
+  double kZAxisTravelCostMultiplier;
+  double kMaxClimbRatePerSegment;
+
   bool ReadParameters(rclcpp::Node::SharedPtr nh);
 };
 class LocalCoveragePlanner

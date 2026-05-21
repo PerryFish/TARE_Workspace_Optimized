@@ -27,6 +27,7 @@
 #include <deque>
 #include <cmath>
 #include <string>
+#include <mutex>
 
 class ModeManagerNode : public rclcpp::Node
 {
@@ -124,11 +125,13 @@ private:
   // ================================================================
   void WaypointCallback(const geometry_msgs::msg::PointStamped::ConstSharedPtr msg)
   {
+    std::lock_guard<std::mutex> lock(data_mutex_);
     latest_waypoint_ = Eigen::Vector3d(msg->point.x, msg->point.y, msg->point.z);
   }
 
   void GlobalPathCallback(const nav_msgs::msg::Path::ConstSharedPtr msg)
   {
+    std::lock_guard<std::mutex> lock(data_mutex_);
     global_path_.clear();
     for (const auto &pose : msg->poses)
     {
@@ -141,22 +144,38 @@ private:
 
   void ObstacleCloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
   {
-    obstacle_points_.clear();
-    sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
-    sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
-    sensor_msgs::PointCloud2ConstIterator<float> iter_z(*msg, "z");
+    if (!msg) { return; }
+    std::vector<Eigen::Vector3d> obstacle_points;
+    obstacle_points.reserve(static_cast<size_t>(msg->width) * static_cast<size_t>(msg->height));
 
-    for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z)
-    {
-      obstacle_points_.emplace_back(*iter_x, *iter_y, *iter_z);
+    try {
+      sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
+      sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
+      sensor_msgs::PointCloud2ConstIterator<float> iter_z(*msg, "z");
+
+      for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z)
+      {
+        if (std::isfinite(*iter_x) && std::isfinite(*iter_y) && std::isfinite(*iter_z))
+        {
+          obstacle_points.emplace_back(*iter_x, *iter_y, *iter_z);
+        }
+      }
+    } catch (const std::runtime_error &e) {
+      RCLCPP_ERROR(this->get_logger(), "Invalid PointCloud2 fields: %s", e.what());
+      return;
     }
 
-    // Run obstacle detection immediately on new cloud
-    CheckObstaclesOnPath();
+    bool detected = false;
+    {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      detected = CheckObstaclesOnPath(obstacle_points);
+      obstacle_detected_ = detected;
+    }
   }
 
   void OdometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
   {
+    std::lock_guard<std::mutex> lock(data_mutex_);
     current_position_ = Eigen::Vector3d(
         msg->pose.pose.position.x,
         msg->pose.pose.position.y,
@@ -167,12 +186,11 @@ private:
   // ================================================================
   // Core: Obstacle Detection — check point cloud against path corridor
   // ================================================================
-  void CheckObstaclesOnPath()
+  bool CheckObstaclesOnPath(const std::vector<Eigen::Vector3d> &obstacle_points)
   {
-    if (!has_odom_ || global_path_.empty() || obstacle_points_.empty())
+    if (!has_odom_ || global_path_.empty() || obstacle_points.empty())
     {
-      obstacle_detected_ = false;
-      return;
+      return false;
     }
 
     // Build a collision corridor along the global path from robot to lookahead
@@ -183,7 +201,7 @@ private:
 
     // Count obstacle points within safety radius of the corridor
     int collision_count = 0;
-    for (const auto &obs_pt : obstacle_points_)
+    for (const auto &obs_pt : obstacle_points)
     {
       // Quick AABB reject
       double min_x = std::min(current_position_.x(), lookahead_pt.x()) - safety_radius_;
@@ -214,7 +232,7 @@ private:
       }
     }
 
-    obstacle_detected_ = (collision_count >= obs_point_thr_);
+    return collision_count >= obs_point_thr_;
   }
 
   // ================================================================
@@ -222,6 +240,7 @@ private:
   // ================================================================
   void ControlLoop()
   {
+    std::lock_guard<std::mutex> lock(data_mutex_);
     if (!has_odom_) return;
 
     double now = this->now().seconds();
@@ -389,7 +408,7 @@ private:
     if (global_path_.empty())
     {
       // Fallback: use latest TARE waypoint
-      return latest_waypoint_;
+      return IsFinite(latest_waypoint_) ? latest_waypoint_ : current_position_;
     }
 
     // Walk along the global path accumulating distance until lookahead reached
@@ -399,20 +418,22 @@ private:
     for (size_t i = 0; i < global_path_.size(); ++i)
     {
       double seg_len = (global_path_[i] - prev).norm();
+      if (!std::isfinite(seg_len)) { continue; }
       if (accumulated + seg_len >= lh_dist)
       {
         // Interpolate within this segment
         double remaining = lh_dist - accumulated;
         double t = (seg_len > 1e-9) ? (remaining / seg_len) : 0.0;
         t = std::max(0.0, std::min(1.0, t));
-        return prev + t * (global_path_[i] - prev);
+        Eigen::Vector3d target = prev + t * (global_path_[i] - prev);
+        return IsFinite(target) ? target : current_position_;
       }
       accumulated += seg_len;
       prev = global_path_[i];
     }
 
     // Path exhausted — return last point
-    return global_path_.back();
+    return IsFinite(global_path_.back()) ? global_path_.back() : current_position_;
   }
 
   // ================================================================
@@ -450,10 +471,18 @@ private:
   {
     Eigen::Vector3d ab = b - a;
     Eigen::Vector3d ap = p - a;
-    double t = ab.dot(ap) / ab.squaredNorm();
+    double ab_len2 = ab.squaredNorm();
+    if (ab_len2 < 1e-12) { return (p - a).norm(); }
+    double t = ab.dot(ap) / ab_len2;
     t = std::max(0.0, std::min(1.0, t));
     Eigen::Vector3d closest = a + t * ab;
     return (p - closest).norm();
+  }
+
+  static bool IsFinite(const Eigen::Vector3d &value)
+  {
+    return std::isfinite(value.x()) && std::isfinite(value.y()) &&
+           std::isfinite(value.z());
   }
 
   // ================================================================
@@ -512,10 +541,10 @@ private:
         goal_marker.color.b = 1.0; break;
     }
 
-    Eigen::Vector3d goal_pt = ComputeLookaheadPoint();
-    goal_marker.pose.position.x = goal_pt.x();
-    goal_marker.pose.position.y = goal_pt.y();
-    goal_marker.pose.position.z = goal_pt.z();
+    // Reuse cached lookahead from corridor marker computation above
+    goal_marker.pose.position.x = lookahead.x();
+    goal_marker.pose.position.y = lookahead.y();
+    goal_marker.pose.position.z = lookahead.z();
     goal_marker.pose.orientation.w = 1.0;
     local_goal_marker_pub_->publish(goal_marker);
   }
@@ -563,7 +592,6 @@ private:
   Eigen::Vector3d current_position_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d latest_waypoint_{Eigen::Vector3d::Zero()};
   std::vector<Eigen::Vector3d> global_path_;
-  std::vector<Eigen::Vector3d> obstacle_points_;
   bool has_odom_{false};
 
   // Members — Parameters
@@ -573,6 +601,9 @@ private:
   double rejoin_speed_, rejoin_tol_;
   int obs_point_thr_;
   bool publish_markers_;
+
+  // Thread safety: serializes all callback/timer access to shared state
+  mutable std::mutex data_mutex_;
 };
 
 int main(int argc, char **argv)

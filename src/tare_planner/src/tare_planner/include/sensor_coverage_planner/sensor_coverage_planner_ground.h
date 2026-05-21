@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include <mutex>
 #include <cmath>
 #include <vector>
 
@@ -360,6 +361,9 @@ private:
 
   void PrintExplorationStatus(std::string status, bool clear_last_line = true);
   void CountDirectionChange();
+
+  // Thread safety: protects blacklist_regions_ and related vectors
+  mutable std::mutex blacklist_mutex_;
 };
 
 } // namespace sensor_coverage_planner_3d_ns

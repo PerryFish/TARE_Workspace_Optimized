@@ -14,6 +14,7 @@
 #include <memory>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
+#include <mutex>
 
 using namespace std::chrono_literals;
 
@@ -646,7 +647,7 @@ void SensorCoveragePlanner3D::ViewPointBoundaryCallback(
 
 void SensorCoveragePlanner3D::NogoBoundaryCallback(
     const geometry_msgs::msg::PolygonStamped::ConstSharedPtr polygon_msg) {
-  if (polygon_msg->polygon.points.empty()) {
+  if (!polygon_msg || polygon_msg->polygon.points.empty()) {
     return;
   }
   double polygon_id = polygon_msg->polygon.points[0].z;
@@ -668,6 +669,9 @@ void SensorCoveragePlanner3D::NogoBoundaryCallback(
 
   geometry_msgs::msg::Point point;
   for (int i = 0; i < nogo_boundary.size(); i++) {
+    if (nogo_boundary[i].points.empty()) {
+      continue;
+    }
     for (int j = 0; j < nogo_boundary[i].points.size() - 1; j++) {
       point.x = nogo_boundary[i].points[j].x;
       point.y = nogo_boundary[i].points[j].y;
@@ -692,10 +696,14 @@ void SensorCoveragePlanner3D::NogoBoundaryCallback(
 
 void SensorCoveragePlanner3D::JoystickCallback(
     const sensor_msgs::msg::Joy::ConstSharedPtr joy_msg) {
+  if (!joy_msg) {
+    return;
+  }
   if (kResetWaypointJoystickAxesID >= 0 &&
-      kResetWaypointJoystickAxesID < joy_msg->axes.size()) {
+      static_cast<size_t>(kResetWaypointJoystickAxesID) < joy_msg->axes.size()) {
+    const size_t axis_idx = static_cast<size_t>(kResetWaypointJoystickAxesID);
     if (reset_waypoint_joystick_axis_value_ > -0.1 &&
-        joy_msg->axes[kResetWaypointJoystickAxesID] < -0.1) {
+        joy_msg->axes[axis_idx] < -0.1) {
       reset_waypoint_ = true;
 
       // Set waypoint to the current robot position to stop the robot in place
@@ -709,7 +717,7 @@ void SensorCoveragePlanner3D::JoystickCallback(
       std::cout << "reset waypoint" << std::endl;
     }
     reset_waypoint_joystick_axis_value_ =
-        joy_msg->axes[kResetWaypointJoystickAxesID];
+        joy_msg->axes[axis_idx];
   }
 }
 
@@ -765,6 +773,10 @@ int SensorCoveragePlanner3D::UpdateViewPoints() {
   misc_utils_ns::Timer collision_cloud_timer("update collision cloud");
   collision_cloud_timer.Start();
   collision_cloud_->cloud_ = planning_env_->GetCollisionCloud();
+  if (!collision_cloud_->cloud_) {
+    RCLCPP_ERROR(this->get_logger(), "UpdateViewPoints: planning_env returned null collision cloud");
+    return 0;
+  }
   collision_cloud_timer.Stop(false);
 
   misc_utils_ns::Timer viewpoint_manager_update_timer(
@@ -775,8 +787,12 @@ int SensorCoveragePlanner3D::UpdateViewPoints() {
         large_terrain_cloud_->cloud_);
   }
   if (kCheckTerrainCollision) {
-    *(collision_cloud_->cloud_) += *(terrain_collision_cloud_->cloud_);
-    *(collision_cloud_->cloud_) += *(terrain_ext_collision_cloud_->cloud_);
+    if (terrain_collision_cloud_ && terrain_collision_cloud_->cloud_) {
+      *(collision_cloud_->cloud_) += *(terrain_collision_cloud_->cloud_);
+    }
+    if (terrain_ext_collision_cloud_ && terrain_ext_collision_cloud_->cloud_) {
+      *(collision_cloud_->cloud_) += *(terrain_ext_collision_cloud_->cloud_);
+    }
   }
   viewpoint_manager_->CheckViewPointCollision(collision_cloud_->cloud_);
   viewpoint_manager_->CheckViewPointLineOfSight();
@@ -788,12 +804,19 @@ int SensorCoveragePlanner3D::UpdateViewPoints() {
   // Filter candidate viewpoints against blacklisted regions BEFORE
   // TSP planning to avoid wasting computation on unreachable areas.
   // ============================================================
-  if (!blacklist_regions_.empty()) {
+  std::vector<Eigen::Vector3d> blacklist_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(blacklist_mutex_);
+    if (!blacklist_regions_.empty()) {
+      blacklist_snapshot = blacklist_regions_;
+    }
+  }
+  if (!blacklist_snapshot.empty()) {
     std::vector<int> candidate_indices = viewpoint_manager_->GetViewPointCandidateIndices();
     int filtered_count = 0;
     for (int idx : candidate_indices) {
       geometry_msgs::msg::Point vp_pos = viewpoint_manager_->GetViewPointPosition(idx, true);
-      for (const auto& bl_region : blacklist_regions_) {
+      for (const auto& bl_region : blacklist_snapshot) {
         double dx = vp_pos.x - bl_region.x();
         double dy = vp_pos.y - bl_region.y();
         double dz = vp_pos.z - bl_region.z();
@@ -852,6 +875,10 @@ void SensorCoveragePlanner3D::UpdateViewPointCoverage() {
 void SensorCoveragePlanner3D::UpdateRobotViewPointCoverage() {
   pcl::PointCloud<pcl::PointXYZI>::Ptr cloud =
       planning_env_->GetCollisionCloud();
+  if (!cloud) {
+    RCLCPP_WARN(this->get_logger(), "UpdateRobotViewPointCoverage: collision cloud is null");
+    return;
+  }
   for (const auto &point : cloud->points) {
     if (viewpoint_manager_->InFOVAndRange(
             Eigen::Vector3d(point.x, point.y, point.z),
@@ -1417,7 +1444,10 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
 
   lookahead_point_direction_ = lookahead_point - robot_position;
   lookahead_point_direction_.z() = 0.0;
-  lookahead_point_direction_.normalize();
+  double direction_norm = lookahead_point_direction_.norm();
+  if (direction_norm > 1e-9) {
+    lookahead_point_direction_ /= direction_norm;
+  }
 
   pcl::PointXYZI point;
   point.x = lookahead_point.x();
@@ -1437,13 +1467,32 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
 }
 
 void SensorCoveragePlanner3D::CleanExpiredBlacklist(double current_time) {
-  // Remove blacklist entries older than kBlacklistExpirationSeconds
+  std::lock_guard<std::mutex> lock(blacklist_mutex_);
   if (kBlacklistExpirationSeconds <= 0.0 || blacklist_regions_.empty()) {
+    return;
+  }
+  if (blacklist_retry_counts_.size() != blacklist_regions_.size() ||
+      blacklist_timestamps_.size() != blacklist_regions_.size()) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "BLACKLIST CORRUPTION: region/count/timestamp sizes differ. Clearing blacklist.");
+    blacklist_regions_.clear();
+    blacklist_retry_counts_.clear();
+    blacklist_timestamps_.clear();
+    return;
+  }
+  if (!std::isfinite(current_time)) {
+    RCLCPP_WARN(this->get_logger(),
+                "BLACKLIST EXPIRATION: current_time is not finite. Skipping cleanup.");
     return;
   }
   size_t write_idx = 0;
   for (size_t i = 0; i < blacklist_regions_.size(); i++) {
     double age = current_time - blacklist_timestamps_[i];
+    // Guard against clock jumps / simulation reset: negative age means
+    // timestamp is in the future - treat as expired for safety.
+    if (!std::isfinite(age) || age < 0.0) {
+      age = kBlacklistExpirationSeconds + 1.0;
+    }
     if (age < kBlacklistExpirationSeconds) {
       if (write_idx != i) {
         blacklist_regions_[write_idx] = blacklist_regions_[i];
@@ -1478,7 +1527,7 @@ void SensorCoveragePlanner3D::PublishWaypoint() {
     double extend_dist = lookahead_point_in_line_of_sight_
                              ? kExtendWayPointDistanceBig
                              : kExtendWayPointDistanceSmall;
-    if (r < extend_dist && kExtendWayPoint) {
+    if (r > 1e-9 && r < extend_dist && kExtendWayPoint) {
       dx = dx / r * extend_dist;
       dy = dy / r * extend_dist;
     }
@@ -1492,68 +1541,74 @@ void SensorCoveragePlanner3D::PublishWaypoint() {
   // ============================================================
   // Purge expired entries before checking
   double current_time = this->now().seconds();
-  CleanExpiredBlacklist(current_time);
   Eigen::Vector3d waypoint_pos(waypoint.point.x, waypoint.point.y,
                                 waypoint.point.z);
 
   bool redirected = false;
-  for (int redirect_attempt = 0; redirect_attempt < 3; redirect_attempt++) {
-    bool in_blacklist = false;
-    for (size_t i = 0; i < blacklist_regions_.size(); i++) {
-      double dist_to_blacklist = (waypoint_pos - blacklist_regions_[i]).norm();
-      if (dist_to_blacklist < kRegionBlacklistRadius) {
-        in_blacklist = true;
+  CleanExpiredBlacklist(current_time);
+  {
+    std::lock_guard<std::mutex> lock(blacklist_mutex_);
+
+    for (int redirect_attempt = 0; redirect_attempt < 3; redirect_attempt++) {
+      bool in_blacklist = false;
+      for (size_t i = 0; i < blacklist_regions_.size(); i++) {
+        double dist_to_blacklist = (waypoint_pos - blacklist_regions_[i]).norm();
+        if (dist_to_blacklist < kRegionBlacklistRadius) {
+          in_blacklist = true;
+          break;
+        }
+      }
+
+      if (!in_blacklist) {
+        break;
+      }
+
+      // This waypoint is in a blacklisted region - redirect
+      RCLCPP_WARN(rclcpp::get_logger("standalone_logger"),
+                  "REGION BLACKLIST: Redirect attempt %d - waypoint at (%.2f, %.2f) "
+                  "is in blacklisted region.",
+                  redirect_attempt + 1, waypoint.point.x, waypoint.point.y);
+
+      Eigen::Vector3d to_waypoint = waypoint_pos - Eigen::Vector3d(robot_position_.x, robot_position_.y, robot_position_.z);
+      to_waypoint.z() = 0;
+      double to_waypoint_norm = to_waypoint.norm();
+      if (to_waypoint_norm > 0.1) {
+        to_waypoint /= to_waypoint_norm;
+        double angle_offset = (redirect_attempt * 0.5) + 1.5708;
+        Eigen::Vector3d perpendicular(
+            -to_waypoint.y() * cos(angle_offset) + to_waypoint.x() * sin(angle_offset),
+            to_waypoint.x() * cos(angle_offset) + to_waypoint.y() * sin(angle_offset),
+            0);
+        double perp_norm = perpendicular.norm();
+        if (perp_norm > 1e-9) { perpendicular /= perp_norm; }
+        double alternative_distance = std::min(std::max(r, 0.1), 3.0);
+
+        waypoint.point.x = robot_position_.x + perpendicular.x() * alternative_distance;
+        waypoint.point.y = robot_position_.y + perpendicular.y() * alternative_distance;
+        waypoint.point.z = lookahead_point_.z();
+
+        waypoint_pos = Eigen::Vector3d(waypoint.point.x, waypoint.point.y,
+                                        waypoint.point.z);
+        redirected = true;
+      } else {
         break;
       }
     }
 
-    if (!in_blacklist) {
-      break;
-    }
-
-    // This waypoint is in a blacklisted region - redirect
-    RCLCPP_WARN(rclcpp::get_logger("standalone_logger"),
-                "REGION BLACKLIST: Redirect attempt %d - waypoint at (%.2f, %.2f) "
-                "is in blacklisted region.",
-                redirect_attempt + 1, waypoint.point.x, waypoint.point.y);
-
-    Eigen::Vector3d to_waypoint = waypoint_pos - Eigen::Vector3d(robot_position_.x, robot_position_.y, robot_position_.z);
-    to_waypoint.z() = 0;
-    if (to_waypoint.norm() > 0.1) {
-      to_waypoint.normalize();
-      double angle_offset = (redirect_attempt * 0.5) + 1.5708;
-      Eigen::Vector3d perpendicular(
-          -to_waypoint.y() * cos(angle_offset) + to_waypoint.x() * sin(angle_offset),
-          to_waypoint.x() * cos(angle_offset) + to_waypoint.y() * sin(angle_offset),
-          0);
-      perpendicular.normalize();
-      double alternative_distance = std::min(r, 3.0);
-
-      waypoint.point.x = robot_position_.x + perpendicular.x() * alternative_distance;
-      waypoint.point.y = robot_position_.y + perpendicular.y() * alternative_distance;
-      waypoint.point.z = lookahead_point_.z();
-
-      waypoint_pos = Eigen::Vector3d(waypoint.point.x, waypoint.point.y,
-                                      waypoint.point.z);
-      redirected = true;
-    } else {
-      break;
-    }
-  }
-
-  // If all directions are blacklisted, force exploration to finish
-  if (redirected) {
-    bool still_in_blacklist = false;
-    for (size_t i = 0; i < blacklist_regions_.size(); i++) {
-      if ((waypoint_pos - blacklist_regions_[i]).norm() < kRegionBlacklistRadius) {
-        still_in_blacklist = true;
-        break;
+    // If all directions are blacklisted, force exploration to finish
+    if (redirected) {
+      bool still_in_blacklist = false;
+      for (size_t i = 0; i < blacklist_regions_.size(); i++) {
+        if ((waypoint_pos - blacklist_regions_[i]).norm() < kRegionBlacklistRadius) {
+          still_in_blacklist = true;
+          break;
+        }
       }
-    }
-    if (still_in_blacklist) {
-      RCLCPP_ERROR(rclcpp::get_logger("standalone_logger"),
-                  "REGION BLACKLIST: ALL directions blacklisted! Forcing exploration finish.");
-      exploration_finished_ = true;
+      if (still_in_blacklist) {
+        RCLCPP_ERROR(rclcpp::get_logger("standalone_logger"),
+                    "REGION BLACKLIST: ALL directions blacklisted! Forcing exploration finish.");
+        exploration_finished_ = true;
+      }
     }
   }
 
@@ -1851,28 +1906,31 @@ void SensorCoveragePlanner3D::execute() {
         // Purge expired entries before adding new region
         CleanExpiredBlacklist(current_time_watchdog);
 
-        // Add stuck region to permanent blacklist
-        Eigen::Vector3d stuck_region_center = watchdog_lookahead_point_;
-        bool already_blacklisted = false;
-        for (size_t i = 0; i < blacklist_regions_.size(); i++) {
-            double dist = (stuck_region_center - blacklist_regions_[i]).norm();
-            if (dist < kRegionBlacklistRadius) {
-                already_blacklisted = true;
-                blacklist_retry_counts_[i] = kRegionBlacklistMaxRetries;
-                break;
-            }
-        }
+        // Add stuck region to permanent blacklist (lock scope)
+        {
+          std::lock_guard<std::mutex> lock(blacklist_mutex_);
+          Eigen::Vector3d stuck_region_center = watchdog_lookahead_point_;
+          bool already_blacklisted = false;
+          for (size_t i = 0; i < blacklist_regions_.size(); i++) {
+              double dist = (stuck_region_center - blacklist_regions_[i]).norm();
+              if (dist < kRegionBlacklistRadius) {
+                  already_blacklisted = true;
+                  blacklist_retry_counts_[i] = kRegionBlacklistMaxRetries;
+                  break;
+              }
+          }
 
-        if (!already_blacklisted && blacklist_regions_.size() < (size_t)kRegionBlacklistMaxSize) {
-            blacklist_regions_.push_back(stuck_region_center);
-            blacklist_retry_counts_.push_back(kRegionBlacklistMaxRetries);
-            blacklist_timestamps_.push_back(current_time_watchdog);
-            RCLCPP_ERROR(this->get_logger(),
-                        "REGION BLACKLIST: Added PERMANENT region at (%.2f, %.2f, %.2f). "
-                        "Radius: %.2f m. Total: %zu",
-                        stuck_region_center.x(), stuck_region_center.y(),
-                        stuck_region_center.z(), kRegionBlacklistRadius,
-                        blacklist_regions_.size());
+          if (!already_blacklisted && blacklist_regions_.size() < (size_t)kRegionBlacklistMaxSize) {
+              blacklist_regions_.push_back(stuck_region_center);
+              blacklist_retry_counts_.push_back(kRegionBlacklistMaxRetries);
+              blacklist_timestamps_.push_back(current_time_watchdog);
+              RCLCPP_ERROR(this->get_logger(),
+                          "REGION BLACKLIST: Added PERMANENT region at (%.2f, %.2f, %.2f). "
+                          "Radius: %.2f m. Total: %zu",
+                          stuck_region_center.x(), stuck_region_center.y(),
+                          stuck_region_center.z(), kRegionBlacklistRadius,
+                          blacklist_regions_.size());
+          }
         }
 
         // Reset watchdog
